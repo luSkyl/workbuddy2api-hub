@@ -62,6 +62,7 @@ import wb_accounts
 import wb_activity
 import wb_atrest
 import wb_catalog
+import wb_custom_models
 import wb_egress
 import wb_ipintel
 import wb_logstore
@@ -10501,6 +10502,59 @@ def fetch_models(realm=None):
             _catalog_meta[r] = {"source": source, "fetched_at": time.time(),
                                 "file_mtime": file_mtime}
         return entries
+wb_custom_models.set_logger(log)
+
+
+def custom_model_entries():
+    """Build /v1/models entries for the user-declared custom upstreams.
+
+    Only ids and capability metadata are exposed - the upstream URL and the
+    apiKey never appear here (they live in wb_custom_models internal specs).
+    """
+    out = []
+    for spec in wb_custom_models.public_models():
+        item = model_entry(spec["id"], spec.get("meta") or {})
+        item["owned_by"] = "custom"
+        out.append(item)
+    return out
+
+
+def custom_upstream_body(payload):
+    """Client payload -> body for a custom OpenAI-compatible upstream.
+
+    Verbatim pass-through except private keys (leading underscore): custom
+    upstreams speak standard OpenAI Chat Completions, so WorkBuddy-specific
+    rewrites (build_upstream_body) must not run here.
+    """
+    return {k: v for k, v in payload.items() if not str(k).startswith("_")}
+
+
+class _SSEDataCounter(object):
+    """Upstream wrapper that counts SSE data events.
+
+    Supports both consumption styles the translation layer uses: read1()
+    (iter_sse_lines / aggregate_stream) and line iteration
+    (stream_responses_events iterates the source directly). Only the
+    zero-event case is acted on, so over-counting is harmless.
+    """
+
+    def __init__(self, source):
+        self._src = source
+        self.data_events = 0
+
+    def read1(self, n=-1):
+        chunk = self._src.read1(n)
+        if chunk and b"data:" in chunk:
+            self.data_events += 1
+        return chunk
+
+    def __iter__(self):
+        for line in self._src:
+            if b"data:" in line:
+                self.data_events += 1
+            yield line
+
+
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
@@ -16839,6 +16893,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         data = [model_entry(mid, meta) for mid, meta in entries]
+        # Custom upstreams (models.json) are appended at response time,
+        # outside the built-in catalogue cache, so config edits show up
+        # immediately. Only ids/capabilities are exposed - never the URL key.
+        custom = custom_model_entries()
+        if custom:
+            data = data + custom
         payload = {"object": "list", "data": data,
                    "realm": req_realm or CURRENT_REALM}
         # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
@@ -19219,6 +19279,347 @@ class Handler(BaseHTTPRequestHandler):
                      account=account.uid, key=self._key_id(), effort=effort)
         return self._json(200, result)
 
+    # ---- custom upstreams (models.json) -----------------------------------
+    #
+    # A custom model routes to the URL + apiKey the user declared in
+    # ~/.workbuddy/models.json, straight to that host. It never touches the
+    # WorkBuddy account pool, WorkBuddy request rewrites or web-tool proxying
+    # - the upstream speaks plain OpenAI Chat Completions. The apiKey lives
+    # only in the Authorization header towards that upstream and is scrubbed
+    # from anything that echoes back to the client or the log.
+
+    def _custom_dispatch(self, path, payload, spec):
+        model = spec["id"]
+        t_start = time.time()
+        # The per-key model whitelist applies to custom models too: a key
+        # restricted to a model list must not silently widen to them.
+        key_blocked = self._key_model_error(model)
+        if key_blocked:
+            return self._error(400, key_blocked, "invalid_request_error")
+        want_stream = bool(payload.get("stream"))
+        is_responses = path in ("/v1/responses", "/responses")
+        if is_responses:
+            # Reuse the proven Responses<->Chat translation; the custom
+            # upstream always sees Chat Completions, always streamed.
+            chat_req = responses_to_chat(payload)
+            ns_map = chat_req.pop("_namespace_map", None)
+            all_tools = payload.get("tools")
+            all_tools = list(all_tools) if isinstance(all_tools, list) else []
+            all_tools.extend(additional_tools_from_input(payload))
+            custom_names = custom_tool_names(all_tools)
+            request_meta = {
+                "tools": all_tools,
+                "tool_choice": payload.get("tool_choice", "auto"),
+                "parallel_tool_calls": payload.get("parallel_tool_calls", True),
+            }
+            chat_req["stream"] = True
+        else:
+            chat_req = custom_upstream_body(payload)
+            ns_map = None
+            custom_names = set()
+            request_meta = None
+            # Upstream is always streamed (like the built-in path): a client
+            # that asked for non-streaming gets the stream aggregated below.
+            # Requesting stream=false would leave the socket idle until the
+            # whole generation finishes and trip the header timeout on any
+            # long completion.
+            chat_req["stream"] = True
+        chat_req["model"] = model
+        # models.json may declare a default reasoning effort; apply it when
+        # the client did not pick one (chat: reasoning_effort, responses:
+        # already resolved by responses_to_chat).
+        default_effort = ((spec.get("meta") or {}).get("reasoning") or {}).get("defaultEffort")
+        if default_effort and not chat_req.get("reasoning_effort") \
+                and not chat_req.get("reasoning"):
+            chat_req["reasoning_effort"] = default_effort
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        # Diagnostics only: knobs, never message text, never the key.
+        log("custom: model=%s upstream=%s stream=%s msgs=%d"
+            % (model, spec.get("host") or "", want_stream,
+               len(chat_req.get("messages") or [])), tag="chat")
+        header_timeout, idle_timeout = upstream_timeouts()
+        try:
+            upstream = wb_custom_models.open_chat(
+                spec, chat_req, timeout=header_timeout)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(600).decode("utf-8", "replace")
+            except Exception:
+                detail = str(exc)
+            detail = wb_custom_models.redact_text(detail, spec)
+            record_error(model, exc.code, detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            if 300 <= exc.code < 400:
+                # Redirects are never followed (wb_custom_models._NoRedirect):
+                # following one could replay the bearer key to another host.
+                return self._error(502,
+                                   "custom upstream redirect rejected: %s"
+                                   % exc.code)
+            return self._error(exc.code, "upstream %s: %s" % (exc.code, detail))
+        except (socket.timeout, TimeoutError) as exc:
+            record_error(model, 504, "custom upstream timed out",
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            return self._error(504, "custom upstream timed out: %s" % exc)
+        except urllib.error.URLError as exc:
+            if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
+                record_error(model, 504, "custom upstream timed out",
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             key=self._key_id())
+                return self._error(504, "custom upstream timed out")
+            message = wb_custom_models.redact_text(str(exc), spec)
+            record_error(model, 502, message,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            return self._error(502, "custom upstream unreachable: %s" % message)
+        except Exception as exc:
+            message = wb_custom_models.redact_text(str(exc), spec)
+            record_error(model, 502, message,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            return self._error(502, "custom upstream unreachable: %s" % message)
+        try:
+            _apply_stream_idle_timeout(upstream, idle_timeout)
+        except Exception:
+            pass
+        with upstream:
+            if is_responses:
+                if want_stream:
+                    return self._custom_responses_stream(
+                        upstream, model, custom_names, request_meta, fp,
+                        t_start, ns_map)
+                return self._custom_responses_nonstream(
+                    upstream, model, custom_names, request_meta, fp,
+                    t_start, ns_map)
+            if want_stream:
+                return self._custom_chat_stream(upstream, model, fp, t_start)
+            return self._custom_chat_nonstream(upstream, model, fp, t_start)
+
+    def _custom_chat_stream(self, upstream, model, fp, t_start):
+        """SSE passthrough for a custom upstream chat stream."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        out_buf = []
+
+        def flush_out():
+            if out_buf:
+                data = b"".join(out_buf)
+                out_buf.clear()
+                self.wfile.write(data)
+                self.wfile.flush()
+
+        usage = None
+        first_ms = None
+        emitted = False
+        saw_done = False
+        try:
+            for line in iter_sse_lines(upstream, before_read=flush_out):
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                data = strip_data_prefix(line.decode("utf-8", "replace"))
+                if data:
+                    emitted = True
+                    if data == "[DONE]":
+                        saw_done = True
+                    else:
+                        try:
+                            chunk = json.loads(data)
+                            u = chunk.get("usage")
+                            if u and (usage is None or
+                                      (u.get("total_tokens") or 0) >=
+                                      (usage.get("total_tokens") or 0)):
+                                usage = u
+                        except Exception:
+                            pass
+                out_buf.append(line)
+            flush_out()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, usage, stream=True, elapsed_ms=wall,
+                         ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, outcome="client_aborted", key=self._key_id())
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "stream aborted: %s" % exc,
+                         elapsed_ms=wall, usage=usage, stream=True,
+                         ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+            try:
+                self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        wall = int((time.time() - t_start) * 1000)
+        if not emitted:
+            # No event, no fake success: surface the dead upstream as an
+            # in-band SSE error instead of a silent empty completion.
+            record_error(model, 502, "empty custom upstream stream",
+                         elapsed_ms=wall, stream=True, fp=fp,
+                         key=self._key_id())
+            try:
+                self.wfile.write(
+                    b'data: {"error": {"message": "empty custom upstream stream",'
+                    b' "type": "server_error"}}' + bytes([10, 10]))
+                self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        if not saw_done:
+            try:
+                self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
+                self.wfile.flush()
+            except Exception:
+                pass
+        record_usage(model, usage, stream=True, elapsed_ms=wall,
+                     ttft_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     fp=fp, key=self._key_id())
+
+    def _custom_chat_nonstream(self, upstream, model, fp, t_start):
+        """Non-streaming chat: aggregate the upstream stream into one object.
+
+        The upstream always streams (see _custom_dispatch); folding it here
+        keeps long generations alive on the idle timeout instead of the much
+        shorter header timeout, and gives the same usage capture as the
+        built-in path. An empty stream is an error, never a fake completion.
+        """
+        try:
+            counter = _SSEDataCounter(upstream)
+            chat_obj = aggregate_stream(counter, model, None)
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "custom upstream read failed: %s" % exc,
+                         elapsed_ms=wall, fp=fp, key=self._key_id())
+            return self._error(502, "upstream read error: %s" % exc)
+        wall = int((time.time() - t_start) * 1000)
+        if counter.data_events == 0:
+            record_error(model, 502, "empty custom upstream stream",
+                         elapsed_ms=wall, fp=fp, key=self._key_id())
+            return self._error(502, "empty upstream stream")
+        record_usage(model, chat_obj.get("usage"), stream=False,
+                     elapsed_ms=wall, fp=fp, key=self._key_id())
+        return self._json(200, chat_obj)
+
+    def _custom_responses_stream(self, upstream, model, custom_names,
+                                 request_meta, fp, t_start, namespace_map=None):
+        """Responses API events translated from a custom upstream chat stream.
+
+        Single round: the gateway never proxies web tools for custom upstreams
+        (holder has no base_body, so same-named calls belong to the client).
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        holder = {"usage": None, "custom_names": custom_names,
+                  "request_meta": request_meta,
+                  "namespace_map": namespace_map,
+                  "base_messages": None}
+        first_ms = None
+        # Count upstream SSE data events as they are read. stream_responses_
+        # events always synthesises a closing response.completed frame, so a
+        # dead upstream (200 but zero events) would otherwise look like a
+        # successful empty answer - hold the last frame back and swap it for
+        # an in-band error when nothing ever arrived.
+        counter = _SSEDataCounter(upstream)
+        emitted_error = False
+        try:
+            pending = None
+            for frame in stream_responses_events(counter, model, holder):
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                if pending is not None:
+                    self.wfile.write(clean_responses_frame(pending))
+                    self.wfile.flush()
+                pending = frame
+            if pending is not None:
+                tail = clean_responses_frame(pending)
+                if counter.data_events == 0 and b"response.completed" in tail:
+                    emitted_error = True
+                    wall = int((time.time() - t_start) * 1000)
+                    record_error(model, 502, "empty custom upstream stream",
+                                 elapsed_ms=wall, stream=True, fp=fp,
+                                 key=self._key_id())
+                    try:
+                        self.wfile.write(
+                            b'data: {"error": {"message": '
+                            b'"empty custom upstream stream",'
+                            b' "type": "server_error"}}' + bytes([10, 10]))
+                        self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                else:
+                    self.wfile.write(tail)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            wall = int((time.time() - t_start) * 1000)
+            record_usage(model, holder.get("usage"), stream=True,
+                         elapsed_ms=wall, ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, outcome="client_aborted", key=self._key_id())
+            return
+        except Exception as exc:
+            wall = int((time.time() - t_start) * 1000)
+            record_error(model, 502, "stream aborted: %s" % exc,
+                         elapsed_ms=wall, usage=holder.get("usage"),
+                         stream=True, ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+            try:
+                self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+        wall = int((time.time() - t_start) * 1000)
+        if not emitted_error:
+            record_usage(model, holder.get("usage"), stream=True,
+                         elapsed_ms=wall, ttft_ms=first_ms,
+                         gen_ms=(wall - first_ms) if first_ms is not None else None,
+                         fp=fp, key=self._key_id())
+
+    def _custom_responses_nonstream(self, upstream, model, custom_names,
+                                    request_meta, fp, t_start,
+                                    namespace_map=None):
+        try:
+            counter = _SSEDataCounter(upstream)
+            chat_obj = aggregate_stream(counter, model, None)
+        except Exception as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         key=self._key_id())
+            return self._error(502, "upstream stream error: %s" % exc)
+        wall = int((time.time() - t_start) * 1000)
+        if counter.data_events == 0:
+            record_error(model, 502, "empty custom upstream stream",
+                         elapsed_ms=wall, fp=fp, key=self._key_id())
+            return self._error(502, "empty upstream stream")
+        result = chat_to_response(chat_obj, model, custom_names, request_meta,
+                                  namespace_map)
+        record_usage(model, chat_obj.get("usage"), stream=False,
+                     elapsed_ms=wall, fp=fp, key=self._key_id())
+        return self._json(200, result)
+
     def _handle_messages_count_tokens(self, payload):
         """Best-effort Anthropic count_tokens endpoint.
 
@@ -19570,6 +19971,12 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 return self._error(400, background_request_message(reason),
                                    "invalid_request_error")
+        # Custom upstreams (models.json) route before anything WorkBuddy-
+        # specific: they never touch the account pool, realm checks or the
+        # WorkBuddy body rewrites. The per-key model whitelist still applies.
+        custom_spec = wb_custom_models.upstream_for(payload.get("model"))
+        if custom_spec:
+            return self._custom_dispatch(path, payload, custom_spec)
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
