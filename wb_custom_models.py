@@ -72,11 +72,22 @@ _SECRET_PATTERNS = (
 )
 
 _logger = None  # injected by wb_proxy: callable(message:str)
+_on_change = None  # injected by wb_proxy: callable(specs) on successful parse
 
 
 def set_logger(fn):
     global _logger
     _logger = fn
+
+
+def set_on_change(fn):
+    """Register a callback fired after every successful config re-parse.
+
+    wb_proxy uses it to (re)mint pricing policies for entries that declare
+    their own rates; kept as a hook so this module stays free of wb_pricing.
+    """
+    global _on_change
+    _on_change = fn
 
 
 def _log(message):
@@ -173,6 +184,49 @@ def parse_config(text):
     return specs
 
 
+def _parse_pricing(item):
+    """Optional per-model price declaration -> wb_pricing rate fields.
+
+    Accepted (all per million tokens)::
+
+        "pricing": {"input_per_million": 10.0,
+                    "cached_input_per_million": 1.0,   # optional, defaults to input
+                    "output_per_million": 50.0,
+                    "currency": "USD"}                  # USD (default) or CNY
+
+    Declaring pricing also fixes a real hazard: OpenRouter's price index
+    contains same-named models, so without an explicit declaration a custom
+    model can be silently cost-estimated at a stranger's rates.
+    """
+    raw = item.get("pricing")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("pricing must be an object")
+    fields = {}
+    for src, dst in (("input_per_million", "input_cache_miss"),
+                     ("cached_input_per_million", "input_cache_hit"),
+                     ("output_per_million", "output")):
+        value = raw.get(src)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ConfigError("pricing.%s must be a number" % src)
+        if not (value > 0):
+            raise ConfigError("pricing.%s must be > 0" % src)
+        fields[dst] = value
+    if "input_cache_miss" not in fields or "output" not in fields:
+        raise ConfigError("pricing needs input_per_million and output_per_million")
+    fields.setdefault("input_cache_hit", fields["input_cache_miss"])
+    currency = str(raw.get("currency") or "USD").upper()
+    if currency not in ("USD", "CNY"):
+        raise ConfigError("pricing.currency must be USD or CNY")
+    fields["currency"] = currency
+    return fields
+
+
 def _parse_entry(item):
     if not isinstance(item, dict):
         raise ConfigError("entry is not an object")
@@ -190,6 +244,7 @@ def _parse_entry(item):
         "host": urllib.parse.urlsplit(url).netloc,
         "key": key.strip(),
         "meta": _public_meta(item),
+        "pricing": _parse_pricing(item),
     }
 
 
@@ -246,6 +301,11 @@ def load(force=False):
         return []
     with _cache_lock:
         _cache["key"], _cache["specs"], _cache["error"] = cache_key, specs, error
+    if _on_change:
+        try:
+            _on_change(specs)
+        except Exception as exc:
+            _log("custom models: on-change hook failed: %s" % exc)
     return specs
 
 

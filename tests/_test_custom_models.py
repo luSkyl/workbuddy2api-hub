@@ -56,7 +56,7 @@ def write_config(entries, raw=None):
 
 
 def entry(mid):
-    return {
+    base = {
         "id": mid,
         "name": mid,
         "vendor": "Custom",
@@ -71,6 +71,12 @@ def entry(mid):
         "reasoning": {"defaultEffort": "low",
                       "supportedEfforts": ["low", "high"]},
     }
+    if mid == "gpt-6.1-sol":
+        base["pricing"] = {"input_per_million": 2.0,
+                           "cached_input_per_million": 0.2,
+                           "output_per_million": 8.0,
+                           "currency": "USD"}
+    return base
 
 
 write_config([entry("gpt-6.1-sol"), entry("gpt-6-astra")])
@@ -299,6 +305,25 @@ try:
           MOCK["requests"][-1]["body"].get("reasoning_effort") == "high",
           MOCK["requests"][-1]["body"].get("reasoning_effort"))
 
+    print("[2b] usage rows: realm=custom + declared pricing minted")
+    with open(USAGE_LOG, encoding="utf-8") as fh:
+        rows = [json.loads(l) for l in fh if l.strip()]
+    sol_rows = [r for r in rows if r.get("model") == "gpt-6.1-sol"
+                and r.get("outcome") == "completed"]
+    check("usage row realm=custom (not intl/cn)",
+          sol_rows and sol_rows[-1].get("realm") == "custom",
+          sol_rows[-1].get("realm") if sol_rows else "no rows")
+    check("priced model stamped a cost policy",
+          sol_rows and isinstance(sol_rows[-1].get("cost_policy"), str),
+          sol_rows[-1].get("cost_policy") if sol_rows else "no rows")
+    import wb_pricing
+    pid = sol_rows[-1].get("cost_policy")
+    policy = wb_pricing.load_policies().get(pid) if pid else None
+    check("policy is the declared custom rate (not OpenRouter)",
+          policy and policy.get("or_id") is None
+          and (policy.get("flat") or {}).get("input_cache_miss") == 2.0
+          and (policy.get("flat") or {}).get("output") == 8.0,
+          policy)
     print("[3] chat completions, SSE passthrough")
     code, headers, body = request("POST", "/v1/chat/completions", {
         "model": "gpt-6.1-sol", "stream": True,
@@ -415,6 +440,17 @@ try:
           and '"get_weather"' in raw
           and events and events[-1] == "response.completed",
           (code, events[-3:] if events else events))
+
+    with open(USAGE_LOG, encoding="utf-8") as fh:
+        rows = [json.loads(l) for l in fh if l.strip()]
+    astra_rows = [r for r in rows if r.get("model") == "gpt-6-astra"
+                  and r.get("outcome") == "completed"]
+    check("astra rows realm=custom (tool round-trip done)",
+          astra_rows and astra_rows[-1].get("realm") == "custom",
+          astra_rows[-1].get("realm") if astra_rows else "no rows")
+    check("unpriced model has no policy minted",
+          astra_rows and not astra_rows[-1].get("cost_policy"),
+          astra_rows[-1].get("cost_policy") if astra_rows else "no rows")
 
     print("[6] upstream 401 echoes the key -> must be redacted")
     MOCK["mode"] = "unauthorized"

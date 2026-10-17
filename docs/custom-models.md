@@ -33,6 +33,23 @@ JSON 数组，每个条目至少需要 `id`、`url`（http/https）、`apiKey`�
 - 同名冲突：`models.json` 优先。若把自定义模型命名为内置模型 id，将覆盖内置路由。
 - 每个客户端 API Key 的「模型白名单」限制对自定义模型同样生效。
 
+## 可选：声明单价（修复同名误计价）
+
+条目可带 `pricing`（每百万 token）：
+
+```json
+"pricing": {"input_per_million": 2.0,
+            "cached_input_per_million": 0.2,
+            "output_per_million": 8.0,
+            "currency": "USD"}
+```
+
+声明后网关把它铸成真定价策略（`record_policies`），看板成本列直接可用。**强烈建议声明**：OpenRouter 价目索引里存在同名模型（如 `gpt-6-astra`），不声明时同名自定义模型会被按 OpenRouter 的陌生价目估算成本。`currency` 支持 `USD`（默认，按网关汇率折算人民币）与 `CNY`。未声明的模型维持「未定价」显示，不会被编造价格。
+
+## 用量归属
+
+自定义模型请求的 usage/错误行 `realm` 一律记为 `custom`，不混入 intl/cn 账号池统计；`account` 列为空即代表未走官方账号池。
+
 ## 安全边界
 
 - `apiKey` 只在发往该条目自身上游的 `Authorization: Bearer` 头中出现；不写日志、不进 usage 记录、不出现在 `/v1/models` 响应或任何错误信息里。

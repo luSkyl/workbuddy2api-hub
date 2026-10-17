@@ -858,7 +858,7 @@ def _best_cached_tokens(usage):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
                 account=None, outcome="completed", key=None, effort=None,
-                requested_model=None):
+                requested_model=None, realm=None):
     """Record one finished request as exactly one JSONL row.
 
     A request without a usage block still gets a row (flagged usage_missing):
@@ -901,8 +901,10 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row.update(fp)
     if account:
         row["account"] = account
+    # An explicit realm wins (the custom-upstream path stamps "custom" so
+    # its rows never pollute the intl/cn account-pool statistics).
     acc = POOL.get(account) if (account and POOL) else None
-    row["realm"] = acc.realm if acc else CURRENT_REALM
+    row["realm"] = realm or (acc.realm if acc else CURRENT_REALM)
     # Always written, even when the caller presented no key. The empty value is
     # what separates "ran without a key" from rows written before the field
     # existed; the dashboard reports those as two different buckets, and a
@@ -962,7 +964,7 @@ def _persist_usage(row, fail_label):
 
 def record_error(model, status, message, elapsed_ms=None, account=None,
                  usage=None, stream=None, ttft_ms=None, gen_ms=None, fp=None,
-                 outcome="failed", key=None):
+                 outcome="failed", key=None, realm=None):
     """Record one failed request as exactly one JSONL row.
 
     Passing the account uid records which account the request was bound to, so
@@ -1006,6 +1008,8 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         row["account"] = account
         acc = POOL.get(account) if POOL else None
         row["realm"] = acc.realm if acc else CURRENT_REALM
+    if realm:
+        row["realm"] = realm
     row["key"] = key or ""
     _persist_usage(row, "error persist failed")
     dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
@@ -10505,6 +10509,48 @@ def fetch_models(realm=None):
 wb_custom_models.set_logger(log)
 
 
+def mint_custom_pricing(specs):
+    """Register declared custom-model prices as real pricing policies.
+
+    Without this, a custom model whose id collides with an OpenRouter entry
+    (e.g. gpt-6-astra) is cost-estimated at the stranger's rates. A declared
+    price wins because the policy is minted here and current_policy_id()
+    consults the assignment before the on-demand OpenRouter path.
+    """
+    entries = {}
+    for spec in specs or []:
+        pricing = spec.get("pricing")
+        if pricing:
+            entries[spec["id"]] = {
+                "display": spec["id"],
+                "source": "custom",
+                "currency": pricing["currency"],
+                "unit": 1000000,
+                "flat": {
+                    "input_cache_miss": pricing["input_cache_miss"],
+                    "input_cache_hit": pricing["input_cache_hit"],
+                    "output": pricing["output"],
+                },
+            }
+    if not entries:
+        return
+    try:
+        if not wb_pricing.pricing_enabled():
+            return
+        doc = {"meta": {"base_currency": "CNY",
+                        "usd_cny": wb_pricing.USD_CNY},
+               "models": entries}
+        added, _changed, _assignment = wb_pricing.record_policies(doc, merge=True)
+        if added:
+            log("custom pricing: registered declared rates for %s"
+                % ", ".join(sorted(entries)), tag="chat")
+    except Exception as exc:
+        log("custom pricing: registration failed (%s)" % exc, tag="chat")
+
+
+wb_custom_models.set_on_change(mint_custom_pricing)
+
+
 def custom_model_entries():
     """Build /v1/models entries for the user-declared custom upstreams.
 
@@ -19349,7 +19395,7 @@ class Handler(BaseHTTPRequestHandler):
             detail = wb_custom_models.redact_text(detail, spec)
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
+                         key=self._key_id(), realm="custom")
             if 300 <= exc.code < 400:
                 # Redirects are never followed (wb_custom_models._NoRedirect):
                 # following one could replay the bearer key to another host.
@@ -19360,24 +19406,24 @@ class Handler(BaseHTTPRequestHandler):
         except (socket.timeout, TimeoutError) as exc:
             record_error(model, 504, "custom upstream timed out",
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
+                         key=self._key_id(), realm="custom")
             return self._error(504, "custom upstream timed out: %s" % exc)
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
                 record_error(model, 504, "custom upstream timed out",
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             key=self._key_id())
+                             key=self._key_id(), realm="custom")
                 return self._error(504, "custom upstream timed out")
             message = wb_custom_models.redact_text(str(exc), spec)
             record_error(model, 502, message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
+                         key=self._key_id(), realm="custom")
             return self._error(502, "custom upstream unreachable: %s" % message)
         except Exception as exc:
             message = wb_custom_models.redact_text(str(exc), spec)
             record_error(model, 502, message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
+                         key=self._key_id(), realm="custom")
             return self._error(502, "custom upstream unreachable: %s" % message)
         try:
             _apply_stream_idle_timeout(upstream, idle_timeout)
@@ -19444,7 +19490,7 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, usage, stream=True, elapsed_ms=wall,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="client_aborted", key=self._key_id())
+                         fp=fp, outcome="client_aborted", key=self._key_id(), realm="custom")
             return
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
@@ -19452,7 +19498,7 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, usage=usage, stream=True,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+                         fp=fp, outcome="upstream_aborted", key=self._key_id(), realm="custom")
             try:
                 self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
                 self.wfile.flush()
@@ -19465,7 +19511,7 @@ class Handler(BaseHTTPRequestHandler):
             # in-band SSE error instead of a silent empty completion.
             record_error(model, 502, "empty custom upstream stream",
                          elapsed_ms=wall, stream=True, fp=fp,
-                         key=self._key_id())
+                         key=self._key_id(), realm="custom")
             try:
                 self.wfile.write(
                     b'data: {"error": {"message": "empty custom upstream stream",'
@@ -19484,7 +19530,7 @@ class Handler(BaseHTTPRequestHandler):
         record_usage(model, usage, stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, key=self._key_id())
+                     fp=fp, key=self._key_id(), realm="custom")
 
     def _custom_chat_nonstream(self, upstream, model, fp, t_start):
         """Non-streaming chat: aggregate the upstream stream into one object.
@@ -19500,15 +19546,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
             record_error(model, 502, "custom upstream read failed: %s" % exc,
-                         elapsed_ms=wall, fp=fp, key=self._key_id())
+                         elapsed_ms=wall, fp=fp, key=self._key_id(), realm="custom")
             return self._error(502, "upstream read error: %s" % exc)
         wall = int((time.time() - t_start) * 1000)
         if counter.data_events == 0:
             record_error(model, 502, "empty custom upstream stream",
-                         elapsed_ms=wall, fp=fp, key=self._key_id())
+                         elapsed_ms=wall, fp=fp, key=self._key_id(), realm="custom")
             return self._error(502, "empty upstream stream")
         record_usage(model, chat_obj.get("usage"), stream=False,
-                     elapsed_ms=wall, fp=fp, key=self._key_id())
+                     elapsed_ms=wall, fp=fp, key=self._key_id(), realm="custom")
         return self._json(200, chat_obj)
 
     def _custom_responses_stream(self, upstream, model, custom_names,
@@ -19553,7 +19599,7 @@ class Handler(BaseHTTPRequestHandler):
                     wall = int((time.time() - t_start) * 1000)
                     record_error(model, 502, "empty custom upstream stream",
                                  elapsed_ms=wall, stream=True, fp=fp,
-                                 key=self._key_id())
+                                 key=self._key_id(), realm="custom")
                     try:
                         self.wfile.write(
                             b'data: {"error": {"message": '
@@ -19571,7 +19617,7 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, holder.get("usage"), stream=True,
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="client_aborted", key=self._key_id())
+                         fp=fp, outcome="client_aborted", key=self._key_id(), realm="custom")
             return
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
@@ -19579,7 +19625,7 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, usage=holder.get("usage"),
                          stream=True, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+                         fp=fp, outcome="upstream_aborted", key=self._key_id(), realm="custom")
             try:
                 self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
                 self.wfile.flush()
@@ -19596,7 +19642,7 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, holder.get("usage"), stream=True,
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, key=self._key_id())
+                         fp=fp, key=self._key_id(), realm="custom")
 
     def _custom_responses_nonstream(self, upstream, model, custom_names,
                                     request_meta, fp, t_start,
@@ -19607,17 +19653,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             record_error(model, 502, str(exc),
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         key=self._key_id())
+                         key=self._key_id(), realm="custom")
             return self._error(502, "upstream stream error: %s" % exc)
         wall = int((time.time() - t_start) * 1000)
         if counter.data_events == 0:
             record_error(model, 502, "empty custom upstream stream",
-                         elapsed_ms=wall, fp=fp, key=self._key_id())
+                         elapsed_ms=wall, fp=fp, key=self._key_id(), realm="custom")
             return self._error(502, "empty upstream stream")
         result = chat_to_response(chat_obj, model, custom_names, request_meta,
                                   namespace_map)
         record_usage(model, chat_obj.get("usage"), stream=False,
-                     elapsed_ms=wall, fp=fp, key=self._key_id())
+                     elapsed_ms=wall, fp=fp, key=self._key_id(), realm="custom")
         return self._json(200, result)
 
     def _handle_messages_count_tokens(self, payload):
