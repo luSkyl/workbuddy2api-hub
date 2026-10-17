@@ -10601,6 +10601,43 @@ class _SSEDataCounter(object):
             yield line
 
 
+def custom_chat_tools(tools):
+    """Normalize Responses-style flat tool defs to Chat Completions format.
+
+    responses_to_chat() keeps tools in the flat shape ({"type": "function",
+    "name": ...}) because the WorkBuddy upstream accepts it. Standard
+    OpenAI-compatible custom upstreams expect the nested {"type": "function",
+    "function": {...}} shape and silently ignore flat entries, so the model
+    never sees the tools at all. Chat-format entries pass through unchanged;
+    unknown types are left alone for the upstream to judge.
+    """
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if (tool.get("type") == "function" and "function" not in tool
+                and tool.get("name")):
+            out.append({"type": "function", "function": {
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "parameters": tool.get("parameters")
+                or {"type": "object", "properties": {}},
+            }})
+        else:
+            out.append(tool)
+    return out
+
+
+def custom_chat_tool_choice(tool_choice):
+    """Map a Responses tool_choice to its Chat Completions spelling."""
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function" \
+            and tool_choice.get("name") and "function" not in tool_choice:
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    if tool_choice in ("auto", "none", "required"):
+        return tool_choice
+    return None
+
+
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
@@ -19359,6 +19396,13 @@ class Handler(BaseHTTPRequestHandler):
                 "parallel_tool_calls": payload.get("parallel_tool_calls", True),
             }
             chat_req["stream"] = True
+            # Standard OpenAI upstreams need nested Chat-format tool defs
+            # (the flat Responses shape is silently ignored there).
+            if chat_req.get("tools"):
+                chat_req["tools"] = custom_chat_tools(chat_req["tools"])
+            mapped_choice = custom_chat_tool_choice(payload.get("tool_choice"))
+            if mapped_choice is not None:
+                chat_req["tool_choice"] = mapped_choice
         else:
             chat_req = custom_upstream_body(payload)
             ns_map = None

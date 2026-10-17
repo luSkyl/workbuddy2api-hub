@@ -429,7 +429,22 @@ try:
           code == 200 and calls and calls[0].get("name") == "get_weather"
           and ok_args and out.get("status") == "completed",
           (code, str(out)[:400]))
+    up_tools = (MOCK["requests"][-1]["body"].get("tools") or [])
+    up_fn = (up_tools[0].get("function") or {}) if up_tools else {}
+    check("responses tools converted to chat format for upstream",
+          up_tools and up_tools[0].get("type") == "function"
+          and up_fn.get("name") == "get_weather"
+          and isinstance(up_fn.get("parameters"), dict),
+          up_tools[:1])
     # responses stream: function_call events then completed
+    code, _h, body = request("POST", "/v1/responses", {
+        "model": "gpt-6-astra", "stream": False, "input": "weather?",
+        "tools": [fn_tool], "tool_choice": {"type": "function",
+                                            "name": "get_weather"}}, headers=AUTH)
+    check("named tool_choice mapped to chat spelling",
+          MOCK["requests"][-1]["body"].get("tool_choice")
+          == {"type": "function", "function": {"name": "get_weather"}},
+          MOCK["requests"][-1]["body"].get("tool_choice"))
     code, _h, body = request("POST", "/v1/responses", {
         "model": "gpt-6-astra", "stream": True, "input": "weather?",
         "tools": [fn_tool]}, headers=AUTH)
